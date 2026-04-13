@@ -15,7 +15,7 @@ from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
 
-from .palace import SKIP_DIRS, get_collection, file_already_mined
+from .palace import SKIP_DIRS, get_collection, file_already_mined, mine_lock
 
 READABLE_EXTENSIONS = {
     ".txt",
@@ -434,29 +434,37 @@ def process_file(
         print(f"    [DRY RUN] {filepath.name} → room:{room} ({len(chunks)} drawers)")
         return len(chunks), room
 
-    # Purge stale drawers for this file before re-inserting the fresh chunks.
-    # Converts modified-file re-mines from upsert-over-existing-IDs (which hits
-    # hnswlib's thread-unsafe updatePoint path and can segfault on macOS ARM
-    # with chromadb 0.6.3) into a clean delete+insert, bypassing the update
-    # path entirely.
-    try:
-        collection.delete(where={"source_file": source_file})
-    except Exception:
-        pass
+    # Lock this file so concurrent agents don't interleave delete+insert.
+    # Without the lock, two agents can both pass file_already_mined(),
+    # both delete, and both insert — creating duplicates or losing data.
+    with mine_lock(source_file):
+        # Re-check after acquiring lock — another agent may have just finished
+        if file_already_mined(collection, source_file, check_mtime=True):
+            return 0, room
 
-    drawers_added = 0
-    for chunk in chunks:
-        added = add_drawer(
-            collection=collection,
-            wing=wing,
-            room=room,
-            content=chunk["content"],
-            source_file=source_file,
-            chunk_index=chunk["chunk_index"],
-            agent=agent,
-        )
-        if added:
-            drawers_added += 1
+        # Purge stale drawers for this file before re-inserting the fresh chunks.
+        # Converts modified-file re-mines from upsert-over-existing-IDs (which hits
+        # hnswlib's thread-unsafe updatePoint path and can segfault on macOS ARM
+        # with chromadb 0.6.3) into a clean delete+insert, bypassing the update
+        # path entirely.
+        try:
+            collection.delete(where={"source_file": source_file})
+        except Exception:
+            pass
+
+        drawers_added = 0
+        for chunk in chunks:
+            added = add_drawer(
+                collection=collection,
+                wing=wing,
+                room=room,
+                content=chunk["content"],
+                source_file=source_file,
+                chunk_index=chunk["chunk_index"],
+                agent=agent,
+            )
+            if added:
+                drawers_added += 1
 
     return drawers_added, room
 

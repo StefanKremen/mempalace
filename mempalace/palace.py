@@ -4,6 +4,8 @@ palace.py — Shared palace operations.
 Consolidates collection access patterns used by both miners and the MCP server.
 """
 
+import contextlib
+import hashlib
 import os
 
 from .backends.chroma import ChromaBackend
@@ -48,6 +50,45 @@ def get_collection(
         collection_name=collection_name,
         create=create,
     )
+
+
+@contextlib.contextmanager
+def mine_lock(source_file: str):
+    """Cross-platform file lock for mine operations.
+
+    Prevents multiple agents from mining the same file simultaneously,
+    which causes duplicate drawers when the delete+insert cycle interleaves.
+    """
+    lock_dir = os.path.join(os.path.expanduser("~"), ".mempalace", "locks")
+    os.makedirs(lock_dir, exist_ok=True)
+    lock_path = os.path.join(
+        lock_dir, hashlib.sha256(source_file.encode()).hexdigest()[:16] + ".lock"
+    )
+
+    lf = open(lock_path, "w")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(lf.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lf, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(lf.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lf, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        lf.close()
 
 
 def file_already_mined(collection, source_file: str, check_mtime: bool = False) -> bool:
