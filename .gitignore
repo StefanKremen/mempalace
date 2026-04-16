@@ -36,3 +36,7 @@ venv/
 
 # ChromaDB local data
 *.sqlite3-journal
+
+# MemPalace per-project config (machine-local; not shared across workstations)
+entities.json
+mempalace.yaml
