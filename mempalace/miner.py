@@ -264,16 +264,32 @@ def load_config(project_dir: str) -> dict:
     """Load mempalace.yaml from project directory (falls back to mempal.yaml)."""
     import yaml
 
-    config_path = Path(project_dir).expanduser().resolve() / "mempalace.yaml"
+    resolved_project_dir = Path(project_dir).expanduser().resolve()
+    config_path = resolved_project_dir / "mempalace.yaml"
     if not config_path.exists():
         # Fallback to legacy name
-        legacy_path = Path(project_dir).expanduser().resolve() / "mempal.yaml"
+        legacy_path = resolved_project_dir / "mempal.yaml"
         if legacy_path.exists():
             config_path = legacy_path
         else:
-            print(f"ERROR: No mempalace.yaml found in {project_dir}")
-            print(f"Run: mempalace init {project_dir}")
-            sys.exit(1)
+            wing_name = resolved_project_dir.name
+            print(
+                f"  No mempalace.yaml found in {resolved_project_dir} "
+                f"— using auto-detected defaults (wing='{wing_name}'). "
+                "Directories with the same basename will share a wing; "
+                "add mempalace.yaml to disambiguate.",
+                file=sys.stderr,
+            )
+            return {
+                "wing": wing_name,
+                "rooms": [
+                    {
+                        "name": "general",
+                        "description": "All project files",
+                        "keywords": ["general"],
+                    }
+                ],
+            }
     with open(config_path) as f:
         return yaml.safe_load(f)
 
@@ -447,6 +463,33 @@ def _load_known_entities_raw() -> dict:
     return dict(_ENTITY_REGISTRY_CACHE["raw"])
 
 
+_HALL_KEYWORDS_CACHE = None
+
+
+def detect_hall(content: str) -> str:
+    """Route content to a hall based on keyword scoring.
+
+    Halls connect rooms within a wing — they categorize the TYPE of content
+    (emotional, technical, family, etc.) while rooms categorize the TOPIC.
+    """
+    global _HALL_KEYWORDS_CACHE
+    if _HALL_KEYWORDS_CACHE is None:
+        from .config import MempalaceConfig
+
+        _HALL_KEYWORDS_CACHE = MempalaceConfig().hall_keywords
+    content_lower = content[:3000].lower()
+
+    scores = {}
+    for hall, keywords in _HALL_KEYWORDS_CACHE.items():
+        score = sum(1 for kw in keywords if kw in content_lower)
+        if score > 0:
+            scores[hall] = score
+
+    if scores:
+        return max(scores, key=scores.get)
+    return "general"
+
+
 def _extract_entities_for_metadata(content: str) -> str:
     """Extract entity names from content for metadata tagging.
 
@@ -470,8 +513,10 @@ def _extract_entities_for_metadata(content: str) -> str:
         if re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", content):
             matched.add(name)
 
+    from .palace import _candidate_entity_words
+
     window = content[:_ENTITY_EXTRACT_WINDOW]
-    words = re.findall(r"\b[A-Z][a-z]{2,}\b", window)
+    words = _candidate_entity_words(window)
     freq: dict = {}
     for w in words:
         if w in _ENTITY_STOPLIST:
@@ -508,6 +553,8 @@ def add_drawer(
             metadata["source_mtime"] = os.path.getmtime(source_file)
         except OSError:
             pass
+        # Tag with hall for graph connectivity within wings
+        metadata["hall"] = detect_hall(content)
         # Tag with entity names for filterable search
         entities = _extract_entities_for_metadata(content)
         if entities:
