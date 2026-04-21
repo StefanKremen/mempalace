@@ -4,7 +4,7 @@ MemPalace — Give your AI a memory. No API key required.
 
 Two ways to ingest:
   Projects:      mempalace mine ~/projects/my_app          (code, docs, notes)
-  Conversations: mempalace mine ~/chats/ --mode convos     (Claude, ChatGPT, Slack)
+  Conversations: mempalace mine <convo-dir> --mode convos     (Claude Code, Claude.ai, ChatGPT, Slack exports)
 
 Same palace. Same search. Different ingest strategies.
 
@@ -22,7 +22,7 @@ Commands:
 Examples:
     mempalace init ~/projects/my_app
     mempalace mine ~/projects/my_app
-    mempalace mine ~/chats/claude-sessions --mode convos
+    mempalace mine ~/.claude/projects/-Users-you-Projects-my_app --mode convos --wing my_app
     mempalace search "why did we switch to GraphQL"
     mempalace search "pricing discussion" --wing my_app --room costs
 """
@@ -34,6 +34,38 @@ import argparse
 from pathlib import Path
 
 from .config import MempalaceConfig
+from .version import __version__
+
+
+_MEMPALACE_PROJECT_FILES = ("mempalace.yaml", "entities.json")
+
+
+def _ensure_mempalace_files_gitignored(project_dir) -> bool:
+    """If project_dir is a git repo, ensure MemPalace's per-project files
+    are listed in .gitignore so they don't get committed by accident.
+
+    Returns True if .gitignore was updated, False otherwise. Issue #185:
+    `mempalace init` writes mempalace.yaml + entities.json into the
+    project root, where they previously had no protection against being
+    staged into git.
+    """
+    from pathlib import Path
+
+    project_path = Path(project_dir).expanduser().resolve()
+    if not (project_path / ".git").exists():
+        return False
+    gitignore = project_path / ".gitignore"
+    existing = gitignore.read_text() if gitignore.exists() else ""
+    existing_lines = {line.strip() for line in existing.splitlines()}
+    missing = [p for p in _MEMPALACE_PROJECT_FILES if p not in existing_lines]
+    if not missing:
+        return False
+    prefix = "" if not existing or existing.endswith("\n") else "\n"
+    block = prefix + "\n# MemPalace per-project files (issue #185)\n" + "\n".join(missing) + "\n"
+    with open(gitignore, "a") as f:
+        f.write(block)
+    print(f"  Added {', '.join(missing)} to {gitignore.name}")
+    return True
 
 
 def cmd_init(args):
@@ -42,12 +74,25 @@ def cmd_init(args):
     from .entity_detector import scan_for_detection, detect_entities, confirm_entities
     from .room_detector_local import detect_rooms_local
 
+    cfg = MempalaceConfig()
+
+    # Resolve entity-detection languages: --lang overrides config.
+    lang_arg = getattr(args, "lang", None)
+    if lang_arg:
+        languages = [s.strip() for s in lang_arg.split(",") if s.strip()] or ["en"]
+        cfg.set_entity_languages(languages)
+    else:
+        languages = cfg.entity_languages
+    languages_tuple = tuple(languages)
+
     # Pass 1: auto-detect people and projects from file content
     print(f"\n  Scanning for entities in: {args.dir}")
+    if languages_tuple != ("en",):
+        print(f"  Languages: {', '.join(languages_tuple)}")
     files = scan_for_detection(args.dir)
     if files:
         print(f"  Reading {len(files)} files...")
-        detected = detect_entities(files)
+        detected = detect_entities(files, languages=languages_tuple)
         total = len(detected["people"]) + len(detected["projects"]) + len(detected["uncertain"])
         if total > 0:
             confirmed = confirm_entities(detected, yes=getattr(args, "yes", False))
@@ -62,7 +107,10 @@ def cmd_init(args):
 
     # Pass 2: detect rooms from folder structure
     detect_rooms_local(project_dir=args.dir, yes=getattr(args, "yes", False))
-    MempalaceConfig().init()
+    cfg.init()
+
+    # Pass 3: protect git repos from accidentally committing per-project files
+    _ensure_mempalace_files_gitignored(args.dir)
 
 
 def cmd_mine(args):
@@ -96,6 +144,48 @@ def cmd_mine(args):
             respect_gitignore=not args.no_gitignore,
             include_ignored=include_ignored,
         )
+
+
+def cmd_sweep(args):
+    """Sweep a transcript file or directory.
+
+    The sweeper deduplicates against its own prior writes via
+    deterministic drawer IDs + a timestamp cursor. It does NOT currently
+    coordinate with the file-level miners (miner.py / convo_miner.py) —
+    those produce char-chunked drawers without compatible message
+    metadata, so running both miners may store overlapping content under
+    different IDs.
+    """
+    from .sweeper import sweep, sweep_directory
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    target = os.path.expanduser(args.target)
+
+    if os.path.isfile(target):
+        result = sweep(target, palace_path)
+        print(
+            f"  Swept {target}: +{result['drawers_added']} new, "
+            f"{result['drawers_already_present']} already present, "
+            f"{result['drawers_skipped']} skipped (< cursor)."
+        )
+    elif os.path.isdir(target):
+        result = sweep_directory(target, palace_path)
+        print(
+            f"  Swept {result['files_succeeded']}/{result['files_attempted']} "
+            f"files from {target}: +{result['drawers_added']} new, "
+            f"{result['drawers_already_present']} already present, "
+            f"{result['drawers_skipped']} skipped (< cursor)."
+        )
+        failures = result.get("failures") or []
+        if failures:
+            print(
+                f"  WARNING: {len(failures)} file(s) failed to sweep - see stderr / logs for details.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+    else:
+        print(f"  ERROR: Not a file or directory: {target}", file=sys.stderr)
+        sys.exit(1)
 
 
 def cmd_search(args):
@@ -423,10 +513,17 @@ def cmd_compress(args):
 
 
 def main():
+    version_label = f"MemPalace {__version__}"
     parser = argparse.ArgumentParser(
         description="MemPalace — Give your AI a memory. No API key required.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
+        epilog=f"{version_label}\n\n{__doc__}",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=version_label,
+        help="Show version and exit",
     )
     parser.add_argument(
         "--palace",
@@ -443,6 +540,16 @@ def main():
         "--yes",
         action="store_true",
         help="Auto-accept all detected entities (non-interactive)",
+    )
+    p_init.add_argument(
+        "--lang",
+        default=None,
+        help=(
+            "Comma-separated language codes for entity detection "
+            "(e.g. 'en' or 'en,pt-br'). Defaults to value from config "
+            "(MEMPALACE_ENTITY_LANGUAGES env var or config.json), or 'en'. "
+            "When given, the value is also persisted to config.json."
+        ),
     )
 
     # mine
@@ -480,6 +587,17 @@ def main():
         choices=["exchange", "general"],
         default="exchange",
         help="Extraction strategy for convos mode: 'exchange' (default) or 'general' (5 memory types)",
+    )
+
+    # sweep
+    p_sweep = sub.add_parser(
+        "sweep",
+        help="Tandem miner: catch anything the primary miner missed "
+        "(message-level, timestamp-coordinated, idempotent)",
+    )
+    p_sweep.add_argument(
+        "target",
+        help="A .jsonl transcript file, or a directory to scan recursively",
     )
 
     # search
@@ -614,6 +732,7 @@ def main():
         "mine": cmd_mine,
         "split": cmd_split,
         "search": cmd_search,
+        "sweep": cmd_sweep,
         "mcp": cmd_mcp,
         "compress": cmd_compress,
         "wake-up": cmd_wakeup,
